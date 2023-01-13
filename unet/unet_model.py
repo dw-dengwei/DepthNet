@@ -1,6 +1,8 @@
 """ Full assembly of the parts to form the complete network """
 
+from argparse import RawDescriptionHelpFormatter
 from .unet_parts import *
+from .discriminator import Discriminator, PatchGANDiscriminator
 
 
 class UNet(nn.Module):
@@ -11,26 +13,49 @@ class UNet(nn.Module):
         self.bilinear = bilinear
 
         self.inc = DoubleConv(n_channels, 64)
-        self.down1 = Down(64, 128)
-        self.down2 = Down(128, 256)
-        self.down3 = Down(256, 512)
-        factor = 2 if bilinear else 1
-        self.down4 = Down(512, 1024 // factor)
-        self.up1 = Up(1024, 512 // factor, bilinear)
-        self.up2 = Up(512, 256 // factor, bilinear)
-        self.up3 = Up(256, 128 // factor, bilinear)
-        self.up4 = Up(128, 64, bilinear)
-        self.outc = OutConv(64, n_classes)
+        self.encoder = UNetEncoder(n_channels)
 
-    def forward(self, x):
-        x1 = self.inc(x)
-        x2 = self.down1(x1)
-        x3 = self.down2(x2)
-        x4 = self.down3(x3)
-        x5 = self.down4(x4)
-        x = self.up1(x5, x4)
-        x = self.up2(x, x3)
-        x = self.up3(x, x2)
-        x = self.up4(x, x1)
-        logits = self.outc(x)
-        return logits
+        # self._decoder_share = UNetDecoderShare(bilinear)
+
+        self.reconstruct_decoder = UNetDecoder(bilinear)
+        self.depth_mask_decoder = UNetDecoder(bilinear)
+        # self.mask_decoder = self.depth_decoder
+
+        self.reconstruct_out = OutConv(64, n_classes)
+        self.depth_mask_out = OutConv(64, 1 + 6)
+        # self.mask_out = OutConv(64, 6)
+
+        # self.recon_dis = Discriminator(in_channels=3, feature_size=1 * 751 * 501)
+        # self.depth_dis = Discriminator(in_channels=1, feature_size=1 * 751 * 501)
+        self.recon_dis = PatchGANDiscriminator(in_channels=3)
+        self.depth_dis = PatchGANDiscriminator(in_channels=1)
+
+    def forward(self, x, true_recon, true_depth, mask_true):
+        hidden_state = self.inc(x)
+        hidden_state = self.encoder(hidden_state)
+
+        reconstruct_feature = self.reconstruct_decoder(*hidden_state)
+        depth_mask_feature = self.depth_mask_decoder(*hidden_state)
+        # mask_feature = self.mask_decoder(*hidden_state)
+
+        reconstruct_map = self.reconstruct_out(reconstruct_feature)
+        depth_mask_map = self.depth_mask_out(depth_mask_feature)
+        # mask_map = self.mask_out(mask_feature)
+
+        depth_map = depth_mask_map[:, 0:1, :]
+        mask_map = depth_mask_map[:, 1:, :]
+        # print(depth_map.size(), mask_map.size(), depth_mask_map.size())
+
+        pred_reconstruct_dis = self.recon_dis(reconstruct_map)
+        pred_depth_dis = self.depth_dis(depth_map)
+
+        true_reconstruct_dis = self.recon_dis(true_recon)
+        true_depth_dis = self.depth_dis(true_depth)
+
+        return reconstruct_map, \
+            depth_map, \
+            mask_map, \
+            pred_reconstruct_dis, \
+            pred_depth_dis, \
+            true_reconstruct_dis, \
+            true_depth_dis

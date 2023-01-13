@@ -2,6 +2,8 @@ import argparse
 import logging
 import sys
 from pathlib import Path
+import numpy as np
+import cv2
 
 import torch
 import torch.nn as nn
@@ -16,25 +18,38 @@ from utils.dice_score import dice_loss
 from evaluate import evaluate
 from unet import UNet
 
-dir_img = Path('./data/imgs/')
-dir_mask = Path('./data/masks/')
+from loss import certirian
+
+dir_img = Path('input_image')
+dir_mask = Path('input_mask')
+dir_depth = Path('input_depth')
 dir_checkpoint = Path('./checkpoints/')
+
+def mask_visual(label):
+    label_2_color = [0x00, 0x64, 0xa9, 0xfe, 0xff, 0xaa]
+
+    color = torch.zeros(label.size())
+    for i in range(6):
+        color[label == i] = label_2_color[i]
+    color = color.unsqueeze(1)
+
+    return color.repeat((1, 3, 1, 1))
 
 
 def train_net(net,
               device,
               epochs: int = 5,
-              batch_size: int = 1,
+              batch_size: int = 32,
               learning_rate: float = 1e-5,
               val_percent: float = 0.1,
               save_checkpoint: bool = True,
-              img_scale: float = 0.5,
+              img_scale: float = 1.0,
               amp: bool = False):
     # 1. Create dataset
     try:
-        dataset = CarvanaDataset(dir_img, dir_mask, img_scale)
+        dataset = CarvanaDataset(dir_img, dir_depth, dir_mask, img_scale)
     except (AssertionError, RuntimeError):
-        dataset = BasicDataset(dir_img, dir_mask, img_scale)
+        dataset = BasicDataset(dir_img, dir_depth, dir_mask, img_scale, depth_suffix='Range')
 
     # 2. Split into train / validation partitions
     n_val = int(len(dataset) * val_percent)
@@ -78,7 +93,8 @@ def train_net(net,
         with tqdm(total=n_train, desc=f'Epoch {epoch}/{epochs}', unit='img') as pbar:
             for batch in train_loader:
                 images = batch['image']
-                true_masks = batch['mask']
+                depth_true = batch['depth']
+                mask_true = batch['mask']
 
                 assert images.shape[1] == net.n_channels, \
                     f'Network has been defined with {net.n_channels} input channels, ' \
@@ -86,14 +102,35 @@ def train_net(net,
                     'the images are loaded correctly.'
 
                 images = images.to(device=device, dtype=torch.float32)
-                true_masks = true_masks.to(device=device, dtype=torch.long)
+                recon_true = images.clone().detach()
+                depth_true = depth_true.to(device=device, dtype=torch.float32)
+                mask_true = mask_true.to(device=device, dtype=torch.long)
 
                 with torch.cuda.amp.autocast(enabled=amp):
-                    masks_pred = net(images)
-                    loss = criterion(masks_pred, true_masks) \
-                           + dice_loss(F.softmax(masks_pred, dim=1).float(),
-                                       F.one_hot(true_masks, net.n_classes).permute(0, 3, 1, 2).float(),
-                                       multiclass=True)
+                    recon_pred, \
+                    depth_pred, \
+                    mask_pred, \
+                    pred_recon_dis, \
+                    pred_depth_dis, \
+                    true_recon_dis, \
+                    true_depth_dis = net(images, recon_true, depth_true, mask_true)
+
+                    loss, \
+                    (loss_gen, loss_dis_adv), \
+                    (x1000_loss_depth, x100_loss_mask, loss_recon) = certirian(
+                        recon_true,
+                        depth_true,
+                        mask_true,
+                        recon_pred,
+                        depth_pred,
+                        mask_pred,
+                        pred_recon_dis,
+                        pred_depth_dis,
+                        true_recon_dis,
+                        true_depth_dis,
+                        device
+                    )
+                
 
                 optimizer.zero_grad(set_to_none=True)
                 grad_scaler.scale(loss).backward()
@@ -104,7 +141,18 @@ def train_net(net,
                 global_step += 1
                 epoch_loss += loss.item()
                 experiment.log({
-                    'train loss': loss.item(),
+                    'train': {
+                        'loss': loss.item(),
+                        'loss_gen': loss_gen.item(),
+                        'loss_dis_adv': loss_dis_adv.item(),
+                        'x1000_loss_depth': x1000_loss_depth.item(),
+                        'x100_loss_mask': x100_loss_mask.item(), 
+                        'loss_recon': loss_recon.item(),
+                        'pred_recon_dis': pred_recon_dis.mean().item(),
+                        'true_recon_dis': true_recon_dis.mean().item(),
+                        'pred_depth_dis': pred_depth_dis.mean().item(),
+                        'true_depth_dis': true_depth_dis.mean().item(),
+                    },
                     'step': global_step,
                     'epoch': epoch
                 })
@@ -120,18 +168,46 @@ def train_net(net,
                             histograms['Weights/' + tag] = wandb.Histogram(value.data.cpu())
                             histograms['Gradients/' + tag] = wandb.Histogram(value.grad.data.cpu())
 
-                        val_score = evaluate(net, val_loader, device)
+                        val_score, \
+                        (val_loss_gen, val_loss_dis_adv), \
+                        (val_x1000_loss_depth, val_x100_loss_mask, val_loss_recon), \
+                        val_log \
+                            = evaluate(net, val_loader, device)
                         scheduler.step(val_score)
 
                         logging.info('Validation Dice score: {}'.format(val_score))
+
+                        soft = nn.Softmax2d()
+                        mask_pred = soft(mask_pred).argmax(1)
+                        visual_pred = mask_visual(mask_pred)
+                        visual_true = mask_visual(mask_true)
+                        norm_recon_pred = np.zeros(recon_pred.size(), dtype=np.float32)
+                        cv2.normalize(
+                            recon_pred.detach().cpu().numpy(), 
+                            norm_recon_pred,  
+                            alpha=0, 
+                            beta=1, 
+                            norm_type=cv2.NORM_MINMAX
+                        )
+                        norm_recon_pred *= 255
+
                         experiment.log({
                             'learning rate': optimizer.param_groups[0]['lr'],
-                            'validation Dice': val_score,
-                            'images': wandb.Image(images[0].cpu()),
-                            'masks': {
-                                'true': wandb.Image(true_masks[0].float().cpu()),
-                                'pred': wandb.Image(masks_pred.argmax(dim=1)[0].float().cpu()),
+                            'validation loss': val_score,
+                            'recon': {
+                                'true': wandb.Image(recon_true.cpu()),
+                                # 'pred': wandb.Image(recon_pred.cpu()),
+                                'pred': wandb.Image(torch.tensor(norm_recon_pred)),
                             },
+                            'depth': {
+                                'true': wandb.Image(depth_true.cpu()),
+                                'pred': wandb.Image(depth_pred.cpu()),
+                            },
+                            'mask':{
+                                'pred': wandb.Image(visual_pred.cpu(), mode='L'),
+                                'true': wandb.Image(visual_true.cpu(), mode='L')
+                            },
+                            'val': val_log,
                             'step': global_step,
                             'epoch': epoch,
                             **histograms
@@ -150,18 +226,19 @@ def get_args():
     parser.add_argument('--learning-rate', '-l', metavar='LR', type=float, default=1e-5,
                         help='Learning rate', dest='lr')
     parser.add_argument('--load', '-f', type=str, default=False, help='Load model from a .pth file')
-    parser.add_argument('--scale', '-s', type=float, default=0.5, help='Downscaling factor of the images')
+    parser.add_argument('--scale', '-s', type=float, default=1.0, help='Downscaling factor of the images')
     parser.add_argument('--validation', '-v', dest='val', type=float, default=10.0,
                         help='Percent of the data that is used as validation (0-100)')
     parser.add_argument('--amp', action='store_true', default=False, help='Use mixed precision')
     parser.add_argument('--bilinear', action='store_true', default=False, help='Use bilinear upsampling')
-    parser.add_argument('--classes', '-c', type=int, default=2, help='Number of classes')
+    parser.add_argument('--classes', '-c', type=int, default=3, help='Number of classes')
 
     return parser.parse_args()
 
 
 if __name__ == '__main__':
     args = get_args()
+    wandb.login(key='253339369d60f859c4c8e26ab213edc19e5c5b0d')
 
     logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')

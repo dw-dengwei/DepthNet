@@ -1,3 +1,5 @@
+input_image/
+input_depth/
 *.pyc
 data/
 __pycache__/
@@ -7,3 +9,4 @@ checkpoints/
 venv/
 .idea/
 wandb/
+input_*/

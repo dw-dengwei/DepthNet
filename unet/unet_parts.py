@@ -32,7 +32,8 @@ class Down(nn.Module):
         super().__init__()
         self.maxpool_conv = nn.Sequential(
             nn.MaxPool2d(2),
-            DoubleConv(in_channels, out_channels)
+            DoubleConv(in_channels, out_channels),
+            nn.Dropout2d(p=0.5)
         )
 
     def forward(self, x):
@@ -71,7 +72,67 @@ class Up(nn.Module):
 class OutConv(nn.Module):
     def __init__(self, in_channels, out_channels):
         super(OutConv, self).__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+        self.out = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=1),
+            # nn.Dropout2d(p=0.5, inplace=True)
+        )
 
     def forward(self, x):
-        return self.conv(x)
+        return self.out(x)
+
+
+class UNetEncoder(nn.Module):
+    def __init__(self, in_channels) -> None:
+        super().__init__()
+        self.down1 = Down(64, 128)
+        self.down2 = Down(128, 256)
+        self.down3 = Down(256, 512)
+        self.down4 = Down(512, 1024)
+        # self.dropout = nn.Dropout2d(p=0.5)
+
+    def forward(self, x1):
+        x2 = self.down1(x1)
+        x3 = self.down2(x2)
+        x4 = self.down3(x3)
+        x5 = self.down4(x4)
+        # x5 = self.dropout(x5)
+        return x1, x2, x3, x4, x5
+
+
+class UNetDecoderShare(nn.Module):
+    def __init__(self, bilinear=False) -> None:
+        super().__init__()
+        factor = 2 if bilinear else 1
+        self.up1 = Up(1024, 512// factor, bilinear)
+        self.up2 = Up(512, 256// factor, bilinear)
+
+    def forward(self, x5, x4, x3):
+        x = self.up1(x5, x4)
+        x = self.up2(x, x3)
+        
+        return x
+
+
+
+class UNetDecoder(nn.Module):
+    def __init__(self, decoder_share: UNetDecoderShare=None, bilinear=False) -> None:
+        super().__init__()
+        factor = 2 if bilinear else 1
+        self.decoder_share = decoder_share
+        if not self.decoder_share:
+            self.up1 = Up(1024, 512// factor, bilinear)
+            self.up2 = Up(512, 256// factor, bilinear)
+
+        self.up3 = Up(256, 128// factor, bilinear)
+        self.up4 = Up(128, 64, bilinear)
+    
+    def forward(self, x1, x2, x3, x4, x5):
+        if not self.decoder_share:
+            x = self.up1(x5, x4)
+            x = self.up2(x, x3)
+        else:
+            x = self.decoder_share(x5, x4, x3)
+        x = self.up3(x, x2)
+        x = self.up4(x, x1)
+
+        return x
